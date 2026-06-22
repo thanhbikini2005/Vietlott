@@ -1,8 +1,8 @@
 """
-scraper_live.py — Scrape kết quả mới nhất, trả về True nếu có kết quả mới
-Nguồn: lotto-8.com (Mega/Power/Lotto) + atrungroi.com (Max 3D+)
+scraper_live.py — Scrape kết quả mới nhất, detect kết quả chưa gửi
+Fix: dùng (game + date + numbers) làm key thay vì chỉ date
 """
-import requests, json, re, time, os
+import requests, json, re, time, os, hashlib
 from datetime import datetime
 from bs4 import BeautifulSoup
 from analysis import BASE_DIR
@@ -22,8 +22,13 @@ SOURCES = {
     "lotto535": "https://www.lotto-8.com/Vietnam/listltoVM35.asp",
 }
 
-# Max 3D+ — dùng atrungroi.com (không bị block)
-MAX3D_URL = "https://atrungroi.com/max3dplus"
+# Lịch quay — để biết hôm nay có game nào không
+SCHEDULE = {
+    "mega645":    [2, 4, 6],        # Thứ 4, 6, CN (weekday: Wed=2, Fri=4, Sun=6)
+    "power655":   [1, 3, 5],        # Thứ 3, 5, 7 (Tue=1, Thu=3, Sat=5)
+    "max3d_plus": [0, 1, 2, 3, 4, 5, 6],  # Mỗi ngày
+    "lotto535":   [0, 1, 2, 3, 4, 5, 6],  # Mỗi ngày
+}
 
 def load_existing():
     if os.path.exists(DATA_FILE):
@@ -41,6 +46,12 @@ def save_sent(sent):
     os.makedirs(os.path.dirname(SENT_FILE), exist_ok=True)
     with open(SENT_FILE, "w", encoding="utf-8") as f:
         json.dump(sent, f, indent=2)
+
+def make_key(game_key, record):
+    """Key unique = game + date + hash(numbers) — tránh duplicate"""
+    nums = record.get("numbers", record.get("bo1", []))
+    nums_str = "-".join(str(n) for n in sorted(nums))
+    return f"{game_key}_{record.get('date', '')}_{nums_str}"
 
 def parse_lotto8(html):
     soup    = BeautifulSoup(html, "html.parser")
@@ -62,52 +73,41 @@ def parse_lotto8(html):
         results.append({"date": date_str, "numbers": nums})
     return results
 
-def parse_max3d_atrungroi(html):
-    """
-    Parse Max 3D+ từ atrungroi.com
-    Kết quả dạng: 2 bộ 3 số, ví dụ: 4-6-8 | 1-2-3
-    """
+def parse_max3d(html):
     soup    = BeautifulSoup(html, "html.parser")
     today   = datetime.now().strftime("%Y-%m-%d")
-    results = []
-
-    # Tìm tất cả số 3 chữ số dạng XXX liên tiếp trên trang
-    text = soup.get_text(" ")
-    # Tìm pattern ngày hôm nay và 6 chữ số 0-9 gần đó
-    date_now = datetime.now().strftime("%d/%m/%Y")
-
-    # Thử tìm bộ số dạng d-d-d
-    pattern = re.findall(r"\b([0-9])[^\d]([0-9])[^\d]([0-9])\b", text)
+    text    = soup.get_text(" ")
+    # Tìm pattern X-X-X (3 chữ số cách nhau bằng dấu gạch hoặc space)
+    pattern = re.findall(r"\b([0-9])\s*[-–]\s*([0-9])\s*[-–]\s*([0-9])\b", text)
     if len(pattern) >= 2:
         bo1 = [int(pattern[0][0]), int(pattern[0][1]), int(pattern[0][2])]
         bo2 = [int(pattern[1][0]), int(pattern[1][1]), int(pattern[1][2])]
-        results.append({"date": today, "bo1": bo1, "bo2": bo2})
-        return results
-
-    # Fallback: tìm số 3 chữ số liên tiếp kiểu "123 456"
-    nums3 = re.findall(r"\b(\d{3})\b", text)
-    nums3 = [n for n in nums3 if all(int(c) <= 9 for c in n)]
+        return [{"date": today, "bo1": bo1, "bo2": bo2}]
+    # Fallback: số 3 chữ số liên tiếp (mỗi chữ số 0-9)
+    nums3 = re.findall(r"\b([0-9]{3})\b", text)
     if len(nums3) >= 2:
-        bo1 = [int(c) for c in nums3[0]]
-        bo2 = [int(c) for c in nums3[1]]
-        results.append({"date": today, "bo1": bo1, "bo2": bo2})
+        return [{"date": today,
+                 "bo1": [int(c) for c in nums3[0]],
+                 "bo2": [int(c) for c in nums3[1]]}]
+    return []
 
-    return results
+def has_draws_today(game_key):
+    """Kiểm tra hôm nay có lịch quay không"""
+    weekday = datetime.now().weekday()  # Mon=0 ... Sun=6
+    return weekday in SCHEDULE.get(game_key, [])
 
 def scrape_latest(game_key, url):
     try:
-        full_url = f"{url}?indexpage=1&orderby=new"
-        r = requests.get(full_url, headers=HEADERS, timeout=20)
+        r = requests.get(f"{url}?indexpage=1&orderby=new", headers=HEADERS, timeout=20)
         r.raise_for_status()
         rows = parse_lotto8(r.text)
-        print(f"  [{game_key}] ✅ {len(rows)} kỳ")
+        print(f"  [{game_key}] ✅ {len(rows)} kỳ gần nhất")
         return rows
     except Exception as e:
-        print(f"  [{game_key}] ❌ LỖI: {e}")
+        print(f"  [{game_key}] ❌ {e}")
         return []
 
-def scrape_max3d_plus():
-    """Thử nhiều nguồn cho Max 3D+"""
+def scrape_max3d():
     sources = [
         ("atrungroi.com", "https://atrungroi.com/max3dplus"),
         ("xskt.com.vn",   "https://xskt.com.vn/xsmax3d"),
@@ -116,70 +116,77 @@ def scrape_max3d_plus():
         try:
             r = requests.get(url, headers={**HEADERS, "Referer": url}, timeout=20)
             r.raise_for_status()
-            rows = parse_max3d_atrungroi(r.text)
+            rows = parse_max3d(r.text)
             if rows:
-                print(f"  [max3d_plus] ✅ Lấy được từ {name}")
+                print(f"  [max3d_plus] ✅ OK từ {name}")
                 return rows
-            else:
-                print(f"  [max3d_plus] ⚠️  {name}: không parse được kết quả")
+            print(f"  [max3d_plus] ⚠️ {name}: không parse được")
         except Exception as e:
             print(f"  [max3d_plus] ❌ {name}: {e}")
     return []
 
-def merge(existing, new_records, key="date"):
-    keys  = {r.get(key) for r in existing}
+def merge(existing, new_records, key_fn):
+    existing_keys = {key_fn(r) for r in existing}
     added = []
     for r in new_records:
-        if r.get(key) not in keys:
+        if key_fn(r) not in existing_keys:
             existing.append(r)
             added.append(r)
-    existing.sort(key=lambda x: x.get(key, ""))
+    existing.sort(key=lambda x: x.get("date", ""))
     return existing, added
 
 def scrape_and_detect_new():
-    """
-    Scrape tất cả game, trả về dict các kết quả MỚI chưa gửi
-    """
     data = load_existing()
     sent = load_sent()
+    today = datetime.now().strftime("%Y-%m-%d")
     new_results = {}
 
     os.makedirs(os.path.join(BASE_DIR, "data"), exist_ok=True)
 
-    # 3 game từ lotto-8.com
     for gkey, url in SOURCES.items():
+        if not has_draws_today(gkey):
+            print(f"  [{gkey}] ⏭ Hôm nay không có lịch quay")
+            continue
         rows = scrape_latest(gkey, url)
-        data[gkey], added = merge(data.get(gkey, []), rows)
+        key_fn = lambda r: make_key(gkey, r)
+        data[gkey], added = merge(data.get(gkey, []), rows, key_fn)
         for r in added:
-            sent_key = f"{gkey}_{r['date']}"
-            if sent_key not in sent:
-                new_results[gkey] = r
-                print(f"  🔔 KQ MỚI: {gkey} ngày {r['date']}: {r.get('numbers')}")
+            if r.get("date") == today:
+                sent_key = make_key(gkey, r)
+                if sent_key not in sent:
+                    new_results[gkey] = r
+                    print(f"  🔔 MỚI: {gkey} {today} → {r.get('numbers')}")
 
     # Max 3D+
-    max3d_rows = scrape_max3d_plus()
-    data["max3d_plus"], added = merge(data.get("max3d_plus", []), max3d_rows, key="date")
+    max3d_rows = scrape_max3d()
+    key_fn_3d = lambda r: make_key("max3d_plus", r)
+    data["max3d_plus"], added = merge(data.get("max3d_plus", []), max3d_rows, key_fn_3d)
     for r in added:
-        sent_key = f"max3d_plus_{r['date']}"
-        if sent_key not in sent:
-            new_results["max3d_plus"] = r
-            print(f"  🔔 KQ MỚI: max3d_plus ngày {r['date']}: {r.get('bo1')} | {r.get('bo2')}")
+        if r.get("date") == today:
+            sent_key = make_key("max3d_plus", r)
+            if sent_key not in sent:
+                new_results["max3d_plus"] = r
+                print(f"  🔔 MỚI: max3d_plus {today} → {r.get('bo1')} | {r.get('bo2')}")
 
-    # Lưu data
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+    if not new_results:
+        # In rõ lý do tại sao không có gì mới
+        weekday_names = ["Thứ 2","Thứ 3","Thứ 4","Thứ 5","Thứ 6","Thứ 7","Chủ nhật"]
+        today_name = weekday_names[datetime.now().weekday()]
+        print(f"\n  📅 Hôm nay {today_name} {today}:")
+        for gkey in ["mega645","power655","max3d_plus","lotto535"]:
+            has = has_draws_today(gkey)
+            print(f"     {'✅' if has else '❌'} {gkey}: {'có lịch quay' if has else 'không quay hôm nay'}")
 
     return new_results, data
 
 def mark_as_sent(game_key, record):
     sent = load_sent()
-    sent_key = f"{game_key}_{record.get('date', '')}"
-    sent[sent_key] = datetime.now().isoformat()
+    sent[make_key(game_key, record)] = datetime.now().isoformat()
     save_sent(sent)
 
 if __name__ == "__main__":
-    new, data = scrape_and_detect_new()
-    if new:
-        print(f"\n🔔 Có {len(new)} kết quả mới: {list(new.keys())}")
-    else:
-        print("\n⏳ Chưa có kết quả mới")
+    new, _ = scrape_and_detect_new()
+    print(f"\n{'🔔 ' + str(len(new)) + ' kết quả mới: ' + str(list(new.keys())) if new else '⏳ Không có kết quả mới'}")
