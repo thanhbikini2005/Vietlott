@@ -2,9 +2,9 @@ name: Vietlott Daily Bot
 
 on:
   schedule:
-    # Chạy mỗi 10 phút từ 0:00 UTC đến 15:00 UTC (tức 7:00 SA - 22:00 tối VN)
-    - cron: "0/10 0-15 * * *"
-  workflow_dispatch:   # Cho phép chạy thủ công
+    # Chạy mỗi 1 tiếng, từ 0:00 UTC đến 15:00 UTC (= 7:00 SA đến 22:00 tối VN)
+    - cron: "0 0-15 * * *"
+  workflow_dispatch:   # Cho phép chạy thủ công bất cứ lúc nào
 
 jobs:
   run-bot:
