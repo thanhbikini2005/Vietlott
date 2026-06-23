@@ -1,6 +1,6 @@
 """
-main.py — Chạy mỗi 10 phút trong GitHub Actions
-Phát hiện kết quả mới → gửi Telegram ngay lập tức
+main.py — Gửi picks lúc 7h sáng, gửi kết quả khi có KQ mới
+Fix: nếu không có picks thì tự tạo picks trước khi gửi kết quả
 """
 import os, json
 from datetime import datetime
@@ -8,10 +8,11 @@ from analysis import analyze_game, load_data, BASE_DIR
 from scraper_live import scrape_and_detect_new, mark_as_sent
 from telegram_sender import (
     send_telegram, build_daily_picks_message,
-    build_result_message, load_scores
+    build_result_message,
 )
 
 PICKS_FILE = os.path.join(BASE_DIR, "data", "today_picks.json")
+PICKS_DATE_FILE = os.path.join(BASE_DIR, "data", "picks_date.txt")
 
 def load_picks():
     if os.path.exists(PICKS_FILE):
@@ -23,88 +24,91 @@ def save_picks(picks):
     os.makedirs(os.path.dirname(PICKS_FILE), exist_ok=True)
     with open(PICKS_FILE, "w", encoding="utf-8") as f:
         json.dump(picks, f, indent=2)
+    # Lưu ngày tạo picks
+    with open(PICKS_DATE_FILE, "w") as f:
+        f.write(datetime.now().strftime("%Y-%m-%d"))
 
-def is_morning(hour_vn):
-    """7:00 SA gửi picks"""
-    return hour_vn == 7
+def picks_are_today():
+    """Kiểm tra picks đã được tạo hôm nay chưa"""
+    if not os.path.exists(PICKS_DATE_FILE):
+        return False
+    with open(PICKS_DATE_FILE) as f:
+        return f.read().strip() == datetime.now().strftime("%Y-%m-%d")
 
-def run_picks(data):
-    """Gửi dự đoán buổi sáng"""
+def make_picks(data):
+    """Tạo picks cho hôm nay"""
     analyses    = {}
     picks_today = {}
-
     for gkey in ["mega645", "power655", "max3d_plus", "lotto535"]:
         a = analyze_game(gkey, data)
         analyses[gkey] = a
         if a:
-            picks_today[gkey] = {
-                "user": a["user_pick"],
-                "ai":   a["ai_pick"],
-            }
-
+            picks_today[gkey] = {"user": a["user_pick"], "ai": a["ai_pick"]}
     save_picks(picks_today)
-    msg = build_daily_picks_message(analyses)
-    return msg
+    return analyses, picks_today
 
-def run_results(new_results, data):
-    """Gửi kết quả ngay khi phát hiện có kết quả mới"""
-    picks   = load_picks()
-    messages = []
-
-    for gkey, actual_result in new_results.items():
-        if gkey not in picks:
-            print(f"  ⚠️  Không có picks cho {gkey} hôm nay — bỏ qua")
-            mark_as_sent(gkey, actual_result)
-            continue
-
-        analysis = analyze_game(gkey, data)
-        if not analysis:
-            continue
-
-        msg = build_result_message(
-            gkey, analysis, actual_result,
-            picks[gkey]["user"],
-            picks[gkey]["ai"]
-        )
-        messages.append((gkey, actual_result, msg))
-
-    return messages
+def is_morning():
+    """7:00-7:59 VN = 0:00-0:59 UTC"""
+    hour_utc = datetime.utcnow().hour
+    return hour_utc == 0
 
 def main():
-    now_vn   = datetime.utcnow().hour + 7  # UTC+7
-    if now_vn >= 24: now_vn -= 24
-    now_str  = datetime.now().strftime("%H:%M %d/%m/%Y")
-    token    = os.environ.get("TELEGRAM_TOKEN")
-    chat_id  = os.environ.get("TELEGRAM_CHAT_ID")
+    now_vn  = (datetime.utcnow().hour + 7) % 24
+    today   = datetime.now().strftime("%Y-%m-%d")
+    token   = os.environ.get("TELEGRAM_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 
-    print(f"🚀 Chạy lúc {now_str} (VN giờ {now_vn}:xx)")
+    print(f"🚀 {datetime.now().strftime('%H:%M %d/%m/%Y')} (VN {now_vn}h)")
 
-    # ── Bước 1: Scrape và phát hiện kết quả mới ──
+    # ── Scrape kết quả mới ──
     print("\n🔄 Kiểm tra kết quả mới...")
     new_results, data = scrape_and_detect_new()
 
-    # ── Bước 2: Gửi picks buổi sáng (7:00-7:09 VN) ──
-    if is_morning(now_vn):
-        print("\n📤 Gửi dự đoán buổi sáng...")
-        msg = run_picks(data)
+    # ── Gửi picks buổi sáng HOẶC nếu chưa có picks hôm nay ──
+    if is_morning() or not picks_are_today():
+        reason = "7h sáng" if is_morning() else "chưa có picks hôm nay"
+        print(f"\n📤 Tạo và gửi picks ({reason})...")
+        analyses, picks_today = make_picks(data)
+        msg = build_daily_picks_message(analyses)
         if token and chat_id:
             send_telegram(msg, token, chat_id)
         else:
             print(msg)
 
-    # ── Bước 3: Gửi kết quả mới (bất kỳ giờ nào) ──
+    # ── Gửi kết quả mới ──
     if new_results:
-        print(f"\n🔔 Phát hiện {len(new_results)} kết quả mới!")
-        messages = run_results(new_results, data)
-        for gkey, actual_result, msg in messages:
+        print(f"\n🔔 {len(new_results)} kết quả mới!")
+        picks = load_picks()
+
+        # Nếu vẫn không có picks → tạo ngay
+        if not picks:
+            print("  ⚠️ Không có picks, tạo ngay...")
+            _, picks = make_picks(data)
+
+        for gkey, actual_result in new_results.items():
+            analysis = analyze_game(gkey, data)
+            if not analysis:
+                mark_as_sent(gkey, actual_result)
+                continue
+
+            if gkey not in picks:
+                print(f"  ⚠️ Không có picks cho {gkey}, bỏ qua phần so sánh")
+                mark_as_sent(gkey, actual_result)
+                continue
+
+            msg = build_result_message(
+                gkey, analysis, actual_result,
+                picks[gkey]["user"],
+                picks[gkey]["ai"]
+            )
             if token and chat_id:
                 send_telegram(msg, token, chat_id)
             else:
                 print(msg)
             mark_as_sent(gkey, actual_result)
-            print(f"  ✅ Đã gửi + đánh dấu: {gkey}")
+            print(f"  ✅ Đã gửi: {gkey}")
     else:
-        print("  ⏳ Chưa có kết quả mới — chờ lần sau")
+        print("⏳ Không có kết quả mới")
 
     print("\n✅ Done!")
 
